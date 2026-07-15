@@ -1,0 +1,139 @@
+# FROM diegosouzapw/omniroute:latest
+
+# USER root
+
+# RUN echo "rebuild-v2"
+
+# ENV PORT=7860
+# ENV HOSTNAME=0.0.0.0
+# ENV DATA_DIR=/data
+# ENV NODE_OPTIONS="--max-old-space-size=512"
+# ENV OMNIROUTE_MIGRATIONS_DIR=/app/migrations
+
+# EXPOSE 7860
+
+# CMD node server.js
+FROM node:20-slim AS builder
+WORKDIR /app
+RUN apt-get update && apt-get install -y git python3 make g++ && rm -rf /var/lib/apt/lists/*
+RUN git clone --depth=1 https://github.com/decolua/9router.git .
+RUN sed -i 's/sameSite: "lax"/sameSite: "none"/' src/app/api/auth/login/route.js
+RUN cat > next.config.mjs << 'NEXTEOF'
+const nextConfig = {
+  output: "standalone",
+  serverExternalPackages: ["better-sqlite3","sql.js","node:sqlite","bun:sqlite"],
+  images:{unoptimized:true},env:{},
+  webpack:(config,{isServer})=>{
+    if(!isServer)config.resolve.fallback={...config.resolve.fallback,fs:false,path:false};
+    config.watchOptions={...config.watchOptions,ignored:/[\/](logs|\.next)[\/]/};return config;
+  },
+  async headers(){return[{source:"/(.*)",headers:[{key:"X-Frame-Options",value:"ALLOWALL"},{key:"Content-Security-Policy",value:"frame-ancestors *"}]}];},
+  async rewrites(){return[
+    {source:"/v1/v1/:path*",destination:"/api/v1/:path*"},{source:"/v1/v1",destination:"/api/v1"},
+    {source:"/codex/:path*",destination:"/api/v1/responses"},{source:"/v1/:path*",destination:"/api/v1/:path*"},
+    {source:"/v1",destination:"/api/v1"}
+  ];}
+};
+export default nextConfig;
+NEXTEOF
+RUN npm install && npm run build
+
+# ---- Runtime ----
+FROM node:20-slim
+RUN apt-get update && apt-get install -y python3 python3-pip && rm -rf /var/lib/apt/lists/*
+RUN pip3 install huggingface_hub --break-system-packages --quiet
+WORKDIR /app
+COPY --from=builder /app/.next/standalone ./
+COPY --from=builder /app/.next/static ./.next/static
+COPY --from=builder /app/public ./public
+COPY --from=builder /app/open-sse ./open-sse
+ENV PORT=7860 HOSTNAME=0.0.0.0
+ENV NEXT_PUBLIC_BASE_URL=https://MattSusan82J8-9router.hf.space
+ENV DB_PATH=/root/.9router/db/data.sqlite
+ENV HF_DATASET=MattSusan82J8/9router
+# ENV SYNC_INTERVAL=3600
+ENV SYNC_INTERVAL=43200
+EXPOSE 7860
+# 在 EXPOSE 7860 后面添加：
+ENV MAX_VERSIONS=3
+
+RUN cat > /sync_db.py << 'PYEOF'
+import os,sys,time
+from huggingface_hub import HfApi
+db=os.environ.get("DB_PATH","/root/.9router/db/data.sqlite")
+tok=os.environ.get("HF_TOKEN",""); ds=os.environ.get("HF_DATASET","MattSusan82J8/9router")
+if not tok: print("[sync] no HF_TOKEN"); sys.exit(0)
+if not os.path.exists(db): print("[sync] no DB"); sys.exit(0)
+print(f"[sync] {os.path.getsize(db)}b -> {ds} @ {time.strftime('%H:%M:%S')}")
+try:
+  HfApi(token=tok).upload_file(path_or_fileobj=db,path_in_repo="data.sqlite",
+    repo_id=ds,repo_type="dataset",commit_message=f"backup {time.strftime('%Y-%m-%d %H:%M')}")
+  print("[sync] OK")
+except Exception as e: print(f"[sync] ERR: {e}")
+PYEOF
+# RUN cat > /sync_db.py << 'PYEOF'
+# import os,sys,time
+# from huggingface_hub import HfApi
+
+# db=os.environ.get("DB_PATH","/root/.9router/db/data.sqlite")
+# tok=os.environ.get("HF_TOKEN",""); ds=os.environ.get("HF_DATASET","MattSusan82J8/9router")
+# max_ver=int(os.environ.get("MAX_VERSIONS","3"))
+
+# if not tok: print("[sync] no HF_TOKEN"); sys.exit(0)
+# if not os.path.exists(db): print("[sync] no DB"); sys.exit(0)
+
+# print(f"[sync] {os.path.getsize(db)}b -> {ds} @ {time.strftime('%H:%M:%S')}")
+
+# try:
+#     api=HfApi(token=tok)
+#     commits=api.list_repo_commits(repo_id=ds,repo_type="dataset")
+#     db_commits=[c for c in commits if c["path"]=="data.sqlite"]
+    
+#     # Cleanup old versions
+#     if len(db_commits)>=max_ver:
+#         for old in db_commits[max_ver:]:
+#             try:
+#                 api.delete_repo_commit(repo_id=ds,commit_id=old["commit_id"],repo_type="dataset")
+#                 print(f"[cleanup] removed {old['commit_id'][:8]}")
+#             except Exception as e:
+#                 print(f"[cleanup] failed: {e}")
+    
+#     api.upload_file(path_or_fileobj=db,path_in_repo="data.sqlite",
+#         repo_id=ds,repo_type="dataset",commit_message=f"backup {time.strftime('%Y-%m-%d %H:%M')}")
+#     print("[sync] OK")
+# except Exception as e: print(f"[sync] ERR: {e}")
+# PYEOF
+
+
+RUN cat > /restore_db.py << 'PYEOF2'
+import os,sys,shutil
+from huggingface_hub import hf_hub_download
+db=os.environ.get("DB_PATH","/root/.9router/db/data.sqlite")
+tok=os.environ.get("HF_TOKEN",""); ds=os.environ.get("HF_DATASET","MattSusan82J8/9router")
+os.makedirs(os.path.dirname(db),exist_ok=True)
+if not tok: print("[restore] no HF_TOKEN"); sys.exit(0)
+print(f"[restore] Pulling from {ds}...")
+try:
+  dl=hf_hub_download(repo_id=ds,filename="data.sqlite",repo_type="dataset",token=tok,local_dir="/tmp/hfr")
+  sz=os.path.getsize(dl)
+  if sz>4096: shutil.copy2(dl,db); print(f"[restore] OK {sz}b")
+  else: print(f"[restore] too small {sz}b, fresh")
+except Exception as e: print(f"[restore] no backup: {e}")
+PYEOF2
+
+# Wrapper script cho trap (tranh sh quoting issues)
+RUN printf '#!/bin/sh\npython3 /sync_db.py\n' > /do_sync.sh && chmod +x /do_sync.sh
+
+RUN cat > /start.sh << 'STARTEOF'
+#!/bin/sh
+python3 /restore_db.py
+node /app/server.js &
+APP_PID=$!
+INTERVAL="${SYNC_INTERVAL:-3600}"
+echo "[start] Sync every ${INTERVAL}s, PID=$$"
+(while true; do sleep "$INTERVAL"; /do_sync.sh; done) &
+trap /do_sync.sh TERM INT
+wait $APP_PID
+STARTEOF
+RUN chmod +x /start.sh
+CMD ["/bin/sh", "/start.sh"]
